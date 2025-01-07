@@ -6,9 +6,19 @@ public enum ConversationError: Error {
 	case converterInitializationFailed
 }
 
+/// Protocol defining methods to handle server events.
+public protocol ConversationDelegate: AnyObject {
+    func conversationDidUpdateIsListening(_ conversation: Conversation, isListening: Bool)
+    func conversationDidUpdateIsPlaying(_ conversation: Conversation, isPlaying: Bool)
+    func conversationDidUpdateIsUserSpeaking(_ conversation: Conversation, isUserSpeaking: Bool)
+    func conversationDidReceiveEvent(_ conversation: Conversation, event: ServerEvent)
+}
+
 @Observable
-public final class Conversation: Sendable {
-	private let client: RealtimeAPI
+public final class Conversation: @unchecked Sendable {
+    @ObservationIgnored private var delegates: NSHashTable<AnyObject> = NSHashTable.weakObjects()
+    
+    private let client: RealtimeAPI
 	@MainActor private var cancelTask: (() -> Void)?
 	private let errorStream: AsyncStream<ServerError>.Continuation
 
@@ -35,17 +45,29 @@ public final class Conversation: Sendable {
 	@MainActor public private(set) var connected: Bool = false
 
 	/// Whether the conversation is currently listening to the user's microphone.
-	@MainActor public private(set) var isListening: Bool = false
+    @MainActor public private(set) var isListening: Bool = false {
+        didSet {
+            notifyDelegates { $0.conversationDidUpdateIsListening(self, isListening: isListening) }
+        }
+    }
 
 	/// Whether this conversation is currently handling voice input and output.
 	@MainActor public private(set) var handlingVoice: Bool = false
 
 	/// Whether the user is currently speaking.
 	/// This only works when using the server's voice detection.
-	@MainActor public private(set) var isUserSpeaking: Bool = false
+	@MainActor public private(set) var isUserSpeaking: Bool = false {
+        didSet {
+            notifyDelegates { $0.conversationDidUpdateIsUserSpeaking(self, isUserSpeaking: isListening) }
+        }
+    }
 
 	/// Whether the model is currently speaking.
-	@MainActor public private(set) var isPlaying: Bool = false
+	@MainActor public private(set) var isPlaying: Bool = false {
+        didSet {
+            notifyDelegates { $0.conversationDidUpdateIsPlaying(self, isPlaying: isPlaying) }
+        }
+    }
 
 	/// A list of messages in the conversation.
 	/// Note that this doesn't include function call events. To get a complete list, use `entries`.
@@ -173,6 +195,30 @@ public final class Conversation: Sendable {
 	public func send(result output: Item.FunctionCallOutput) async throws {
 		try await send(event: .createConversationItem(Item(with: output)))
 	}
+    
+    // MARK: - Delegate Management
+        
+    /// Adds a delegate to receive conversation events.
+    /// - Parameter delegate: The delegate to add.
+    public func addDelegate(_ delegate: ConversationDelegate) {
+        delegates.add(delegate)
+    }
+    
+    /// Removes a delegate from receiving conversation events.
+    /// - Parameter delegate: The delegate to remove.
+    public func removeDelegate(_ delegate: ConversationDelegate) {
+        delegates.remove(delegate)
+    }
+    
+    /// Notifies all registered delegates by executing a closure on each.
+    /// - Parameter closure: The closure containing the delegate method to call.
+    private func notifyDelegates(_ closure: (ConversationDelegate) -> Void) {
+        for delegate in delegates.allObjects {
+            if let delegate = delegate as? ConversationDelegate {
+                closure(delegate)
+            }
+        }
+    }
 }
 
 /// Listening/Speaking public API
@@ -274,6 +320,9 @@ public extension Conversation {
 /// Event handling private API
 private extension Conversation {
 	@MainActor func handleEvent(_ event: ServerEvent) {
+        // Notify delegates about the received event
+        notifyDelegates { $0.conversationDidReceiveEvent(self, event: event) }
+
 		switch event {
 			case let .error(event):
 				errorStream.yield(event.error)
@@ -465,7 +514,7 @@ extension Conversation {
 	private func _keepIsPlayingPropertyUpdated() {
 		withObservationTracking { _ = queuedSamples.isEmpty } onChange: {
 			Task { @MainActor in
-				self.isPlaying = self.queuedSamples.isEmpty
+				self.isPlaying = !self.queuedSamples.isEmpty
 			}
 
 			self._keepIsPlayingPropertyUpdated()
