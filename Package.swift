@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-	name: "SwiftRealtimeOpenAI",
+	name: "OpenAIRealtime",
 	platforms: [
 		.iOS(.v17),
 		.tvOS(.v17),
@@ -13,7 +13,7 @@ let package = Package(
 		.macCatalyst(.v17),
 	],
 	products: [
-		.library(name: "SwiftRealtimeOpenAI", type: .static, targets: ["SwiftRealtimeOpenAI"]),
+		.library(name: "OpenAIRealtime", type: .static, targets: ["OpenAIRealtime"]),
 	],
 	dependencies: [
 		.package(url: "https://github.com/stasel/WebRTC.git", branch: "latest"),
