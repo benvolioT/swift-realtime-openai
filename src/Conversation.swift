@@ -27,7 +27,7 @@ public final class Conversation: @unchecked Sendable {
 	private let queuedSamples = UnsafeMutableArray<String>()
 	private let apiConverter = UnsafeInteriorMutable<AVAudioConverter>()
 	private let userConverter = UnsafeInteriorMutable<AVAudioConverter>()
-	private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!
+    private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!    
 
 	/// A stream of errors that occur during the conversation.
 	public let errors: AsyncStream<ServerError>
@@ -190,6 +190,17 @@ public final class Conversation: @unchecked Sendable {
 		try await send(event: .createConversationItem(Item(message: Item.Message(id: String(randomLength: 32), from: role, content: [.input_text(text)]))))
 		try await send(event: .createResponse(response))
 	}
+    
+    /// Send a  message and wait for a response.
+    /// Optionally, you can provide a response configuration to customize the model's behavior.
+    /// > Note: Calling this function will automatically call `interruptSpeech` if the model is currently speaking.
+    public func send(message: Item.Message, response: Response.Config? = nil) async throws {
+        if await handlingVoice { await interruptSpeech() }
+
+        // Use the provided message instead of creating a new one
+        try await send(event: .createConversationItem(Item(message: message)))
+        try await send(event: .createResponse(response))
+    }
 
 	/// Send the response of a function call.
 	public func send(result output: Item.FunctionCallOutput) async throws {
@@ -226,57 +237,56 @@ public extension Conversation {
 	/// Start listening to the user's microphone and sending audio data to the model.
 	/// This will automatically call `startHandlingVoice` if it hasn't been called yet.
 	/// > Warning: Make sure to handle the case where the user denies microphone access.
-	@MainActor func startListening() throws {
-		guard !isListening else { return }
-		if !handlingVoice { try startHandlingVoice() }
-
-		Task.detached {
-			self.audioEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: self.audioEngine.inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
-				self?.processAudioBufferFromUser(buffer: buffer)
-			}
-		}
-
-		isListening = true
-	}
+    @MainActor func startListening() throws {
+        guard !isListening else { return }
+        if !handlingVoice { try startHandlingVoice() }
+        Task.detached {
+            self.audioEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: self.audioEngine.inputNode.outputFormat(forBus: 0)) { [weak self] buffer, _ in
+                self?.processAudioBufferFromUser(buffer: buffer)
+            }
+        }
+        isListening = true
+    }
 
 	/// Stop listening to the user's microphone.
 	/// This won't stop playing back model responses. To fully stop handling voice conversations, call `stopHandlingVoice`.
-	@MainActor func stopListening() {
-		guard isListening else { return }
+    @MainActor func stopListening() {
+        guard isListening else { return }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        isListening = false
+    }
 
-		audioEngine.inputNode.removeTap(onBus: 0)
-		isListening = false
-	}
+    /// Set up the audio engine, install the tap (once) and start handling voice.
+    /// This tap is responsible for processing the incoming audio.
+    @MainActor func startHandlingVoice() throws {
+        guard !handlingVoice else { return }
+        
+        guard let converter = AVAudioConverter(from: audioEngine.inputNode.outputFormat(forBus: 0), to: desiredFormat) else {
+            throw ConversationError.converterInitializationFailed
+        }
+        userConverter.set(converter)
+        
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+        try audioSession.setActive(true)
+        
+        audioEngine.attach(playerNode)
+        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: converter.inputFormat)
+        try audioEngine.inputNode.setVoiceProcessingEnabled(true)
+        
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+            handlingVoice = true
+        } catch {
+            print("Failed to enable audio engine: \(error)")
+            audioEngine.disconnectNodeInput(playerNode)
+            audioEngine.disconnectNodeOutput(playerNode)
+        
+            throw error
+        }
 
-	/// Handle the playback of audio responses from the model.
-	@MainActor func startHandlingVoice() throws {
-		guard !handlingVoice else { return }
-
-		guard let converter = AVAudioConverter(from: audioEngine.inputNode.outputFormat(forBus: 0), to: desiredFormat) else {
-			throw ConversationError.converterInitializationFailed
-		}
-		userConverter.set(converter)
-
-		let audioSession = AVAudioSession.sharedInstance()
-		try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
-		try audioSession.setActive(true)
-
-		audioEngine.attach(playerNode)
-		audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: converter.inputFormat)
-		try audioEngine.inputNode.setVoiceProcessingEnabled(true)
-
-		audioEngine.prepare()
-		do {
-			try audioEngine.start()
-			handlingVoice = true
-		} catch {
-			print("Failed to enable audio engine: \(error)")
-			audioEngine.disconnectNodeInput(playerNode)
-			audioEngine.disconnectNodeOutput(playerNode)
-
-			throw error
-		}
-	}
+    }
 
 	/// Interrupt the model's response if it's currently playing.
 	/// This lets the model know that the user didn't hear the full response.
@@ -302,26 +312,31 @@ public extension Conversation {
 	}
 
 	/// Stop playing audio responses from the model and listening to the user's microphone.
-	@MainActor func stopHandlingVoice() {
-		guard handlingVoice else { return }
-
-		audioEngine.inputNode.removeTap(onBus: 0)
-		audioEngine.stop()
-		audioEngine.disconnectNodeInput(playerNode)
-		audioEngine.disconnectNodeOutput(playerNode)
-
-		try? AVAudioSession.sharedInstance().setActive(false)
-
-		isListening = false
-		handlingVoice = false
-	}
+    @MainActor func stopHandlingVoice() {
+        guard handlingVoice else { return }
+        
+        // Remove the tap if it's still installed.
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        audioEngine.disconnectNodeInput(playerNode)
+        audioEngine.disconnectNodeOutput(playerNode)
+        
+        try? AVAudioSession.sharedInstance().setActive(false)
+            
+        isListening = false
+        handlingVoice = false
+    }
 }
 
 /// Event handling private API
 private extension Conversation {
 	@MainActor func handleEvent(_ event: ServerEvent) {
-        // Notify delegates about the received event
-        notifyDelegates { $0.conversationDidReceiveEvent(self, event: event) }
+        Task {
+            // Notify delegates about the received event
+            await MainActor.run {
+                self.notifyDelegates { $0.conversationDidReceiveEvent(self, event: event) }
+            }
+        }
 
 		switch event {
 			case let .error(event):
@@ -395,6 +410,12 @@ private extension Conversation {
 				if handlingVoice { interruptSpeech() }
 			case .inputAudioBufferSpeechStopped:
 				isUserSpeaking = false
+            case let .responseOutputItemDone(event):
+                updateEvent(id: event.item.id) { message in
+                    guard case let .message(newMessage) = event.item else { return }
+                    
+                    message = newMessage
+                }
 			default:
 				return
 		}
@@ -426,15 +447,15 @@ private extension Conversation {
 /// Audio processing private API
 private extension Conversation {
 	private func queueAudioSample(_ event: ServerEvent.ResponseAudioDeltaEvent) {
-		guard let buffer = AVAudioPCMBuffer.fromData(event.delta, format: desiredFormat) else {
-			print("Failed to create audio buffer.")
-			return
-		}
-
-		guard let converter = apiConverter.lazy({ AVAudioConverter(from: buffer.format, to: playerNode.outputFormat(forBus: 0)) }) else {
-			print("Failed to create audio converter.")
-			return
-		}
+        guard let buffer = AVAudioPCMBuffer.fromData(event.delta, format: desiredFormat) else {
+            print("Failed to create audio buffer.")
+            return
+        }
+        
+        guard let converter = apiConverter.lazy({ AVAudioConverter(from: buffer.format, to: playerNode.outputFormat(forBus: 0)) }) else {
+            print("Failed to create audio converter.")
+            return
+        }
 
 		let outputFrameCapacity = AVAudioFrameCount(ceil(converter.outputFormat.sampleRate / buffer.format.sampleRate) * Double(buffer.frameLength))
 
@@ -443,26 +464,47 @@ private extension Conversation {
 			return
 		}
 
-		queuedSamples.push(event.itemId)
+        DispatchQueue.main.async {
+            self.queuedSamples.push(event.itemId)
+        }
 
-		playerNode.scheduleBuffer(sample, at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
-			guard let self else { return }
+        playerNode.scheduleBuffer(sample, at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if !self.queuedSamples.isEmpty {
+                    self.queuedSamples.popFirst()
+                }
+                if self.queuedSamples.isEmpty {
+                    self.playerNode.pause()
+                }
+            }
+        }
 
-			self.queuedSamples.popFirst()
-			if self.queuedSamples.isEmpty { playerNode.pause() }
-		}
+        // Ensure the audio engine is running before playing.
+        if !audioEngine.isRunning {
+            do {
+                try audioEngine.start()
+            } catch {
+                print("Failed to start audio engine: \(error)")
+            }
+        }
+        playerNode.play()
 
-		playerNode.play()
 	}
 
 	private func processAudioBufferFromUser(buffer: AVAudioPCMBuffer) {
 		let ratio = desiredFormat.sampleRate / buffer.format.sampleRate
 
-		guard let convertedBuffer = convertBuffer(buffer: buffer, using: userConverter.get()!, capacity: AVAudioFrameCount(Double(buffer.frameLength) * ratio)) else {
-			print("Buffer conversion failed.")
-			return
-		}
-
+        
+        guard let converter = AVAudioConverter(from: buffer.format, to: desiredFormat) else {
+            print("Failed to create converter for input format: \(buffer.format)")
+            return
+        }
+        guard let convertedBuffer = convertBuffer(buffer: buffer, using: converter, capacity: AVAudioFrameCount(Double(buffer.frameLength) * ratio)) else {
+            print("Buffer conversion failed.")
+            return
+        }
+        
 		guard let sampleBytes = convertedBuffer.audioBufferList.pointee.mBuffers.mData else { return }
 		let audioData = Data(bytes: sampleBytes, count: Int(convertedBuffer.audioBufferList.pointee.mBuffers.mDataByteSize))
 
