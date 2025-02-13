@@ -27,7 +27,7 @@ public final class Conversation: @unchecked Sendable {
 	private let queuedSamples = UnsafeMutableArray<String>()
 	private let apiConverter = UnsafeInteriorMutable<AVAudioConverter>()
 	private let userConverter = UnsafeInteriorMutable<AVAudioConverter>()
-    private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!    
+    private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!
 
 	/// A stream of errors that occur during the conversation.
 	public let errors: AsyncStream<ServerError>
@@ -77,6 +77,8 @@ public final class Conversation: @unchecked Sendable {
 			default: return nil
 		} }
 	}
+    
+    @MainActor private var wasListeningBeforeInterruption: Bool = false
 
 	private init(client: RealtimeAPI) {
 		self.client = client
@@ -278,6 +280,16 @@ public extension Conversation {
         do {
             try audioEngine.start()
             handlingVoice = true
+            
+            // Add observers for interruptions and route changes:
+            NotificationCenter.default.addObserver(self,
+                                                   selector: #selector(handleRouteChange(_:)),
+                                                   name: AVAudioSession.routeChangeNotification,
+                                                   object: nil)
+            NotificationCenter.default.addObserver(self,
+                                                   selector: #selector(handleAudioInterruption(_:)),
+                                                   name: AVAudioSession.interruptionNotification,
+                                                   object: nil)
         } catch {
             print("Failed to enable audio engine: \(error)")
             audioEngine.disconnectNodeInput(playerNode)
@@ -315,6 +327,14 @@ public extension Conversation {
     @MainActor func stopHandlingVoice() {
         guard handlingVoice else { return }
         
+        // Remove the observers since we're stopping voice handling
+        NotificationCenter.default.removeObserver(self,
+                                                  name: AVAudioSession.routeChangeNotification,
+                                                  object: nil)
+        NotificationCenter.default.removeObserver(self,
+                                                  name: AVAudioSession.interruptionNotification,
+                                                  object: nil)
+    
         // Remove the tap if it's still installed.
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
@@ -325,6 +345,92 @@ public extension Conversation {
             
         isListening = false
         handlingVoice = false
+    }
+    
+    @objc private func handleRouteChange(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
+        
+        print("Audio route changed: \(reason)")
+        
+        switch reason {
+        case .oldDeviceUnavailable:
+            // Use your higher-level API to restart listening.
+            print("Old device unavailable. Restarting listening.")
+            Task { @MainActor in
+                // Stop and restart listening if it was active.
+                if self.isListening {
+                    self.stopListening()
+                    do {
+                        try self.startListening()
+                    } catch {
+                        print("Error restarting listening after route change: \(error)")
+                    }
+                }
+            }
+            
+        default:
+            break
+        }
+    }
+
+    @objc private func handleAudioInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let interruptionType = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+        
+        switch interruptionType {
+        case .began:
+            print("Audio interruption began.")
+            Task { @MainActor in
+                // Save current listening state before stopping
+                self.wasListeningBeforeInterruption = self.isListening
+                if self.isListening {
+                    self.stopListening()
+                }
+                // Pause playback if it is active
+                if self.isPlaying {
+                    self.playerNode.pause()
+                }
+                // Pause the audio engine if it's running
+                if self.audioEngine.isRunning {
+                    self.audioEngine.pause()
+                }
+            }
+            
+        case .ended:
+            print("Audio interruption ended.")
+            let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue ?? 0)
+            
+            if options.contains(.shouldResume) {
+                Task { @MainActor in
+                    do {
+                        // Restart the audio engine
+                        try self.audioEngine.start()
+                        
+                        // Resume listening if we were listening before the interruption
+                        if self.wasListeningBeforeInterruption {
+                            try self.startListening()
+                            self.wasListeningBeforeInterruption = false
+                        }
+                        
+                        // Resume audio playback if needed
+                        if self.isPlaying {
+                            self.playerNode.play()
+                        }
+                    } catch {
+                        print("Failed to restart audio engine after interruption: \(error)")
+                    }
+                }
+            }
+            
+        @unknown default:
+            break
+        }
     }
 }
 
